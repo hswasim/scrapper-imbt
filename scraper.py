@@ -6,22 +6,40 @@ Replace the example scraping logic with your own.
 """
 import os
 import json
+import re
 import requests
 import pandas as pd
 import time
 import random
 from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 from fake_useragent import UserAgent
 from dlg import send_slack_notification, save_to_gcs
 
 # === CONFIG (auto-set by CI/CD from repo name) ===
-PLATFORM_ID = os.environ.get("PLATFORM_ID", "example")
+PLATFORM_ID = os.environ.get("PLATFORM_ID", "imbt")
+
+# === IMBT CONFIG ===
+BASE_URL = os.environ.get("BASE_URL", "https://itmustbetime.com").rstrip("/")
+COLLECTION_HANDLE = os.environ.get("COLLECTION_HANDLE", "sale")
+
+# Watches only (per brief). If a store mixes straps/accessories, this will
+# attempt to exclude those.
+WATCH_ONLY = os.environ.get("WATCH_ONLY", "1") == "1"
+EXCLUDE_KEYWORDS = tuple(
+    kw.strip().lower()
+    for kw in os.environ.get(
+        "EXCLUDE_KEYWORDS",
+        "strap,band,bracelet-only,accessory,accessories,watch strap,watch band",
+    ).split(",")
+    if kw.strip()
+)
 
 # === SETUP ===
 ua = UserAgent(platforms='desktop')
 HEADERS = {
     "user-agent": ua.random,
-    "accept": "application/json",
+    "accept": "application/json,text/plain,*/*",
 }
 print(f"Using User-Agent: {HEADERS['user-agent']}")
 
@@ -40,85 +58,263 @@ def notify_error(error_type: str, detail: str, status_code: int):
 
 
 # =============================================================================
-# SCRAPING LOGIC (replace with your own)
+# SCRAPING LOGIC (IMBT - Shopify collection JSON)
 # =============================================================================
-def fetch_page(url, page=1, delay_range=(0.2, 0.5)):
-    """
-    Example: Fetch a single page of results
-    Replace with your actual API/scraping logic
-    """
-    try:
-        response = requests.get(
-            url,
-            headers=HEADERS,
-            params={"page": page},
-            timeout=30
-        )
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching page {page}: {e}")
-        return None
-    finally:
-        time.sleep(random.uniform(*delay_range))
+def _sleep(delay_range: Tuple[float, float]):
+    time.sleep(random.uniform(*delay_range))
 
 
-def fetch_all_data(base_url, delay_range=(0.2, 0.5)):
-    """
-    Example: Fetch all pages
-    Replace with your actual pagination logic
-    """
-    all_items = []
-    page = 1
+def _strip_html(html: str) -> str:
+    if not html:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", html)
+    return re.sub(r"\s+", " ", text).strip()
 
-    while True:
-        print(f"Fetching page {page}...")
-        data = fetch_page(base_url, page=page, delay_range=delay_range)
 
-        if not data or not data.get("items"):
+def _tags_to_list(tags: Any) -> List[str]:
+    """
+    Shopify 'tags' is usually a comma-separated string.
+    """
+    if tags is None:
+        return []
+    if isinstance(tags, list):
+        return [str(t).strip() for t in tags if str(t).strip()]
+    if isinstance(tags, str):
+        s = tags.strip()
+        if not s:
+            return []
+        return [t.strip() for t in s.split(",") if t.strip()]
+    return [str(tags).strip()] if str(tags).strip() else []
+
+
+def _pick_reference_number(product: Dict[str, Any]) -> str:
+    variants = product.get("variants") or []
+    if variants:
+        sku = (variants[0].get("sku") or "").strip()
+        if sku:
+            return sku
+    # Per parsing rules: don't try to guess values buried in free text.
+    return ""
+
+
+def _is_watch_product(product: Dict[str, Any]) -> bool:
+    """
+    Heuristic for "watches only" (per brief):
+    - Shopify stores often don't consistently label products as "watch" in title/type/tags.
+    - This store appears to be primarily watches, so we include by default and only
+      exclude obvious accessory-only items.
+    """
+    title = (product.get("title") or "").lower()
+    product_type = (product.get("product_type") or "").lower()
+    tags = " ".join(t.lower() for t in _tags_to_list(product.get("tags")))
+
+    # Exclude accessory-only items
+    haystack = f"{title} {product_type} {tags}"
+    if any(kw in haystack for kw in EXCLUDE_KEYWORDS):
+        return False
+
+    return True
+
+
+def _get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 30) -> Dict[str, Any]:
+    resp = requests.get(url, headers=HEADERS, params=params or {}, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_shopify_collection_products(
+    collection_handle: str,
+    *,
+    limit: int = 250,
+    delay_range: Tuple[float, float] = (0.2, 0.6),
+    max_pages: int = 100,
+) -> List[Dict[str, Any]]:
+    """
+    Shopify endpoint:
+      /collections/{handle}/products.json?limit=250&page=1
+    """
+    products: List[Dict[str, Any]] = []
+    seen_ids = set()
+
+    for page in range(1, max_pages + 1):
+        url = f"{BASE_URL}/collections/{collection_handle}/products.json"
+        print(f"Fetching collection page {page}...")
+        data = _get_json(url, params={"limit": limit, "page": page})
+        page_products = data.get("products") or []
+        if not page_products:
             break
 
-        all_items.extend(data["items"])
+        for p in page_products:
+            pid = p.get("id")
+            if pid and pid in seen_ids:
+                continue
+            if pid:
+                seen_ids.add(pid)
+            products.append(p)
 
-        if page >= data.get("total_pages", 1):
+        if len(page_products) < limit:
             break
 
-        page += 1
+        _sleep(delay_range)
 
-    return pd.DataFrame(all_items)
+    return products
+
+
+def map_shopify_product_to_parsed_row(product: Dict[str, Any], extraction_date: str) -> Dict[str, Any]:
+    """
+    Map Shopify product JSON -> LuxuryIQ schema (best-effort).
+    Missing values must be empty strings.
+    """
+    handle = (product.get("handle") or "").strip()
+    product_url = f"{BASE_URL}/products/{handle}" if handle else ""
+    product_id = str(product.get("id") or "")
+    product_name = (product.get("title") or "").strip()
+    brand = (product.get("vendor") or "").strip()
+
+    variants = product.get("variants") or []
+    any_available = any(bool(v.get("available")) for v in variants) if variants else bool(product.get("available"))
+    availability = "in stock" if any_available else "out of stock"
+
+    # Pricing: Shopify uses compare_at_price to show "full price" (higher) vs discounted.
+    price = ""
+    full_price = ""
+    if variants:
+        v0 = variants[0]
+        p0 = v0.get("price")
+        c0 = v0.get("compare_at_price")
+        price = str(p0).strip() if p0 is not None else ""
+        full_price = str(c0).strip() if c0 is not None else ""
+        # If no discount, keep full_price empty per brief guidance
+        if full_price and price and full_price == price:
+            full_price = ""
+
+    # Images
+    images = product.get("images") or []
+    main_image = images[0].get("src") if images else ""
+    secondary_images = [img.get("src") for img in images[1:] if img.get("src")]
+
+    reference_number = _pick_reference_number(product)
+    description = _strip_html(product.get("body_html") or "")
+
+    # Seller: platform-sold store (no individual sellers)
+    seller_name = "It Must Be Time"
+    seller_id = PLATFORM_ID
+    seller_url = BASE_URL
+
+    # Collect extra specs in JSON bucket (do not over-parse free text)
+    product_specifications = {
+        "tags": _tags_to_list(product.get("tags")),
+        "product_type": product.get("product_type") or "",
+    }
+
+    return {
+        # --- Basic fields (Critical) ---
+        "availability": availability,
+        "brand": brand,
+        "extraction_date": extraction_date,
+        "main_image": main_image,
+        "platform_id": PLATFORM_ID,
+        "product_id": product_id,
+        "product_name": product_name,
+        "product_url": product_url,
+
+        # --- Basic fields (Nice to have) ---
+        # Brief rule: if there's no value, keep cell empty (not "[]").
+        "secondary_images": json.dumps(secondary_images, ensure_ascii=False) if secondary_images else "",
+        "item_location_country": "",
+
+        # --- Seller (Critical) ---
+        "seller_name": seller_name,
+        "seller_id": seller_id,
+        "seller_url": seller_url,
+
+        # --- Prices ---
+        "price": price,
+        "full_price": full_price,
+        "tax_free_price": "",
+        "tax_full_price": "",
+
+        # --- Specs / IDs ---
+        "reference_number": reference_number,
+        # Best-effort: Shopify product_type is structured data and often maps to a collection.
+        "collection": (product.get("product_type") or "").strip(),
+        "case_material": "",
+        "bracelet_material": "",
+        "bezel_material": "",
+        "caliber_size": "",
+        "case_diameter": "",
+        "dial_color": "",
+        "water_resistance": "",
+        "year_of_production": "",
+        "number_of_jewels": "",
+        "complication": "",
+
+        # --- Condition / delivery ---
+        "condition_detail": "",
+        "scope_of_delivery": "",
+
+        # --- Text fields ---
+        "description": description,
+        "detail_of_the_exceptional_piece": "",
+
+        # --- JSON bucket per parsing rules ---
+        "product_specifications": json.dumps(product_specifications, ensure_ascii=False),
+    }
 
 
 # =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
-def run_scraper(delay_range=(0.2, 0.5)):
+def run_scraper(delay_range: Tuple[float, float] = (0.2, 0.6)):
     """Main scraper logic - returns dict with status code and message"""
 
     try:
-        # === REPLACE THIS WITH YOUR SCRAPING LOGIC ===
-        # Example: df = fetch_all_data("https://api.example.com/items", delay_range)
+        extraction_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Placeholder - remove and add your logic
-        print("TODO: Add your scraping logic here")
-        df = pd.DataFrame({"example": ["replace", "with", "real", "data"]})
-        # === END REPLACE ===
+        products = fetch_shopify_collection_products(
+            COLLECTION_HANDLE,
+            delay_range=delay_range,
+        )
 
-        if df.empty:
+        if WATCH_ONLY:
+            products = [p for p in products if _is_watch_product(p)]
+
+        if not products:
             result = {"status": 204, "message": "No data found", "rows": 0}
             print(f"Response: {result}")
             return result
 
-        # Save to /tmp then upload to GCS
-        local_file = "/tmp/data.csv"
-        df.to_csv(local_file, index=False)
-        gcs_path = save_to_gcs(local_file)
+        # Raw output: preserve full product JSON per row (so nothing is lost)
+        raw_rows: List[Dict[str, Any]] = []
+        for p in products:
+            handle = (p.get("handle") or "").strip()
+            raw_rows.append({
+                "platform_id": PLATFORM_ID,
+                "extraction_date": extraction_date,
+                "product_id": str(p.get("id") or ""),
+                "product_url": f"{BASE_URL}/products/{handle}" if handle else "",
+                "raw_json": json.dumps(p, ensure_ascii=False),
+            })
+        raw_df = pd.DataFrame(raw_rows)
+
+        parsed_rows = [map_shopify_product_to_parsed_row(p, extraction_date) for p in products]
+        parsed_df = pd.DataFrame(parsed_rows)
+
+        raw_local_file = "/tmp/raw.csv"
+        parsed_local_file = "/tmp/parsed.csv"
+        raw_df.to_csv(raw_local_file, index=False)
+        parsed_df.to_csv(parsed_local_file, index=False)
+
+        raw_gcs_path = save_to_gcs(raw_local_file, prefix="raw")
+        parsed_gcs_path = save_to_gcs(parsed_local_file)
 
         result = {
             "status": 200,
             "message": "Success",
-            "rows": len(df),
-            "columns": len(df.columns),
-            "gcs_path": gcs_path
+            "rows": len(parsed_df),
+            "columns": len(parsed_df.columns),
+            "raw_gcs_path": raw_gcs_path,
+            "gcs_path": parsed_gcs_path,
         }
         print(f"Response: {result}")
         return result
@@ -142,7 +338,7 @@ def run_scraper(delay_range=(0.2, 0.5)):
         notify_error("Service Unavailable", str(e), 503)
         return result
 
-    except json.JSONDecodeError as e:
+    except (requests.exceptions.JSONDecodeError, json.JSONDecodeError, ValueError) as e:
         result = {"status": 502, "error": "Bad Gateway - Invalid JSON", "detail": str(e)}
         print(f"Response: {result}")
         notify_error("Bad Gateway - Invalid JSON", str(e), 502)
@@ -156,4 +352,4 @@ def run_scraper(delay_range=(0.2, 0.5)):
 
 
 if __name__ == "__main__":
-    run_scraper(delay_range=(0.2, 0.5))
+    run_scraper(delay_range=(0.2, 0.6))
