@@ -1,0 +1,12 @@
+# Core scraping
+requests==2.31.0
+pandas==2.1.4
+fake-useragent==1.5.1
+google-cloud-storage==2.13.0
+
+# Optional: For HTML parsing (uncomment if needed)
+# beautifulsoup4==4.12.2
+# lxml==4.9.3
+
+# Optional: For Playwright (uncomment if needed)
+# playwright==1.40.0
