@@ -25,6 +25,15 @@ COLLECTION_HANDLE = "sale"
 PRODUCT_URL = f"{BASE_URL}/collections/{COLLECTION_HANDLE}/products.json"
 PAGE_LIMIT = 250  # Max 250 per page as per API
 
+EXCLUDE_KEYWORDS = tuple(
+    kw.strip().lower()
+    for kw in os.environ.get(
+        "EXCLUDE_KEYWORDS",
+        "strap,band,bracelet,accessory,accessories,watch strap,watch band,watch case",
+    ).split(",")
+    if kw.strip()
+)
+
 # === SETUP ===
 ua = UserAgent(platforms='desktop')
 HEADERS = {
@@ -51,6 +60,18 @@ def _strip_html(html: str) -> str:
         return ""
     text = re.sub(r"<[^>]+>", " ", html)
     return re.sub(r"\s+", " ", text).strip()
+
+def _is_watch_product(product: Dict[str, Any]) -> bool:
+    title = (product.get("title") or "").lower()
+    product_type = (product.get("product_type") or "").lower()
+    tags = " ".join(t.lower() for t in product.get("tags") or [])
+
+    # Exclude accessory-only items
+    haystack = f"{title} {product_type} {tags}"
+    if any(kw in haystack for kw in EXCLUDE_KEYWORDS):
+        return False
+
+    return True
 
 def map_product_to_parsed_row(product: Dict[str, Any], extraction_date: str) -> Dict[str, Any]:
     handle = (product.get("handle") or "").strip()
@@ -189,6 +210,8 @@ def fetch_all_data(base_url, delay_range=(0.2, 0.5)):
             break
 
         for p in data["items"]:
+            if not _is_watch_product(p):
+                continue
             all_items.append(map_product_to_parsed_row(p, extraction_date))
             # Raw data
             handle = (p.get("handle") or "").strip()
@@ -231,16 +254,16 @@ def run_scraper(delay_range=(0.2, 0.5)):
         raw_df.to_csv(raw_local_file, index=False)
         parsed_df.to_csv(parsed_local_file, index=False)
 
-        raw_gcs_path = save_to_gcs(raw_local_file, prefix="raw")
-        parsed_gcs_path = save_to_gcs(parsed_local_file)
+        # raw_gcs_path = save_to_gcs(raw_local_file, prefix="raw")
+        # parsed_gcs_path = save_to_gcs(parsed_local_file)
 
         result = {
             "status": 200,
             "message": "Success",
             "rows": len(parsed_df),
             "columns": len(parsed_df.columns),
-            "raw_gcs_path": raw_gcs_path,
-            "gcs_path": parsed_gcs_path,
+            # "raw_gcs_path": raw_gcs_path,
+            # "gcs_path": parsed_gcs_path,
         }
         print(f"Response: {result}")
         return result
