@@ -30,7 +30,7 @@ EXCLUDE_KEYWORDS = tuple(
     kw.strip().lower()
     for kw in os.environ.get(
         "EXCLUDE_KEYWORDS",
-        "strap,band,bracelet-only,accessory,accessories,watch strap,watch band",
+        "strap,band,bracelet-only,accessory,accessories,watch strap,watch band,watch case",
     ).split(",")
     if kw.strip()
 )
@@ -39,7 +39,7 @@ INCLUDE_KEYWORDS = tuple(
     kw.strip().lower()
     for kw in os.environ.get(
         "INCLUDE_KEYWORDS",
-        "watch,wristwatch,wrist,chronograph,timepiece,automatic,manual wind,manual-wind,automatic watch",
+        "watch,wristwatch,wrist,chronograph,timepiece,automatic,manual wind,manual-wind,automatic watch,time,omega,corum,audemars piguet,franck muller",
     ).split(",")
     if kw.strip()
 )
@@ -92,9 +92,10 @@ def _is_watch_product(product: Dict[str, Any]) -> bool:
     title = (product.get("title") or "").lower()
     product_type = (product.get("product_type") or "").lower()
     tags = " ".join(t.lower() for t in product.get("tags") or [])
+    vendor = (product.get("vendor") or "").lower()
 
     # Exclude accessory-only items
-    haystack = f"{title} {product_type} {tags}"
+    haystack = f"{title} {product_type} {tags} {vendor}"
     if any(kw in haystack for kw in EXCLUDE_KEYWORDS):
         return False
 
