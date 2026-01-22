@@ -119,14 +119,15 @@ def map_product_to_parsed_row(product: Dict[str, Any], extraction_date: str) -> 
 
     return {
         # --- Basic fields ---
+        "platform_id": PLATFORM_ID,
+        "product_id": product_id,
+        "product_name": product_name,
+        "description": description,
+        "product_url": product_url,
         "availability": availability,
         "brand": brand,
         "extraction_date": extraction_date,
         "main_image": main_image,
-        "platform_id": PLATFORM_ID,
-        "product_id": product_id,
-        "product_name": product_name,
-        "product_url": product_url,
         "secondary_images": json.dumps(secondary_images, ensure_ascii=False) if secondary_images else "",
         "item_location_country": "",
 
@@ -160,7 +161,6 @@ def map_product_to_parsed_row(product: Dict[str, Any], extraction_date: str) -> 
         "scope_of_delivery": "",
 
         # --- Text fields ---
-        "description": description,
         "detail_of_the_exceptional_piece": "",
 
         # --- JSON bucket per parsing rules ---
