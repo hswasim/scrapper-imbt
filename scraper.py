@@ -28,7 +28,7 @@ EXCLUDE_KEYWORDS = tuple(
     kw.strip().lower()
     for kw in os.environ.get(
         "EXCLUDE_KEYWORDS",
-        "strap,band,bracelet,accessory,accessories,case,bag,william henry",
+        "band,bracelet,accessory,accessories,case,bag,william henry",
     ).split(",")
     if kw.strip()
 )
